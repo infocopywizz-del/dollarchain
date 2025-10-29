@@ -28,3 +28,4 @@ Thumbs.db
 # Replit
 .replit
 .cache/
+.vercel
