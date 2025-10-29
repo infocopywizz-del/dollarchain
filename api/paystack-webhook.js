@@ -1,17 +1,15 @@
 // api/paystack-webhook.js
-// Defensive webhook: lazy-load Supabase client and return JSON errors so we can see what's failing.
+// Defensive webhook: lazy-load Supabase client and handle DB calls with try/await (no direct .catch chains)
 
 let supabaseServer = null;
 
 async function getSupabaseServer() {
   if (supabaseServer) return supabaseServer;
   try {
-    // lazy import so missing env or import-time errors are caught inside handler
     const mod = await import("../lib/supabaseServer.js");
     supabaseServer = mod.supabaseServer;
     return supabaseServer;
   } catch (err) {
-    // rethrow so caller can handle
     throw new Error(`Failed to load supabaseServer: ${err && err.message ? err.message : String(err)}`);
   }
 }
@@ -46,38 +44,60 @@ export default async function handler(req, res) {
       }
     }
 
-    // attempt to lazy-load supabase client
+    // lazy-load supabase client
     let sb;
     try {
       sb = await getSupabaseServer();
     } catch (err) {
       console.error("Supabase client load error:", err);
-      // return JSON error (NOT HTML) so the frontend and curl can read it
       return res.status(500).json({ ok: false, error: "supabase_client_load_failed", detail: String(err.message || err) });
     }
 
-    // now run the original logic (kept defensive)
     const reference = body?.data?.reference || body?.reference;
     if (!reference) {
       console.warn("Webhook missing reference. Storing raw event for inspection.");
-      await sb.from("payment_events").insert([{ provider: "paystack", raw_payload: body }]).catch((e) => {
-        console.error("Failed to log unknown webhook event:", e);
-      });
+      try {
+        const { data, error } = await sb.from("payment_events").insert([{ provider: "paystack", raw_payload: body }]);
+        if (error) console.error("Failed to insert unknown webhook event:", error);
+      } catch (e) {
+        console.error("Exception inserting unknown webhook event:", e);
+      }
       return res.status(200).json({ ok: true, note: "no_reference_logged" });
     }
 
     // find order
-    const { data: orders, error: qerr } = await sb.from("orders").select("*").eq("paystack_reference", reference).limit(1);
-    if (qerr) {
-      console.error("Error querying orders table:", qerr);
-      await sb.from("payment_events").insert([{ provider: "paystack", raw_payload: body }]).catch(() => {});
-      return res.status(500).json({ ok: false, note: "orders_query_error", detail: String(qerr.message || qerr) });
+    let orders;
+    try {
+      const q = await sb.from("orders").select("*").eq("paystack_reference", reference).limit(1);
+      // supabase-js v2 returns { data, error }
+      if (q.error) {
+        console.error("Error querying orders table:", q.error);
+        try {
+          const { data, error } = await sb.from("payment_events").insert([{ provider: "paystack", raw_payload: body }]);
+          if (error) console.error("Failed to log orders_query_error event:", error);
+        } catch (ie) {
+          console.error("Exception logging orders_query_error:", ie);
+        }
+        return res.status(500).json({ ok: false, note: "orders_query_error", detail: String(q.error.message || q.error) });
+      }
+      orders = q.data;
+    } catch (e) {
+      console.error("Unexpected error querying orders:", e);
+      try {
+        await sb.from("payment_events").insert([{ provider: "paystack", raw_payload: body }]);
+      } catch (_) {}
+      return res.status(500).json({ ok: false, error: "orders_query_exception", detail: String(e) });
     }
 
     const order = orders?.[0] || null;
     if (!order) {
       console.warn("Webhook received for unknown order:", reference);
-      await sb.from("payment_events").insert([{ provider: "paystack", raw_payload: body }]).catch(() => {});
+      try {
+        const { data, error } = await sb.from("payment_events").insert([{ provider: "paystack", raw_payload: body }]);
+        if (error) console.error("Failed to insert unknown_order_recorded event:", error);
+      } catch (e) {
+        console.error("Exception inserting unknown_order_recorded event:", e);
+      }
       return res.status(200).json({ ok: true, note: "unknown_order_recorded" });
     }
 
@@ -96,33 +116,62 @@ export default async function handler(req, res) {
 
     if (!verifyResp.ok || !verifyJson || verifyJson?.data?.status !== "success") {
       console.warn("Paystack verification failed:", { ok: verifyResp.ok, verifyJson });
-      await sb.from("payment_events").insert([{ order_id: order.id, provider: "paystack", raw_payload: { webhook: body, verify: verifyJson } }]).catch(() => {});
+      try {
+        const { data, error } = await sb.from("payment_events").insert([{ order_id: order.id, provider: "paystack", raw_payload: { webhook: body, verify: verifyJson } }]);
+        if (error) console.error("Failed to insert not_successful event:", error);
+      } catch (e) {
+        console.error("Exception inserting not_successful event:", e);
+      }
       return res.status(200).json({ ok: true, note: "not_successful" });
     }
 
-    // mark order and credit
-    await sb.from("orders").update({ status: "success", webhook_processed: true, processed_at: new Date().toISOString() }).eq("id", order.id);
-
-    const { data: rpcData, error: rpcError } = await sb.rpc("add_credits", {
-      in_client_id: order.client_id,
-      in_amount: order.credits,
-      in_actor: "paystack",
-      in_reason: "payment",
-    });
-
-    if (rpcError) {
-      console.error("add_credits RPC error:", rpcError);
-      await sb.from("payment_events").insert([{ order_id: order.id, provider: "paystack", raw_payload: { webhook: body, verify: verifyJson, rpcError } }]).catch(() => {});
-      return res.status(500).json({ ok: false, note: "rpc_failed", detail: String(rpcError.message || rpcError) });
+    // mark order processed
+    try {
+      const upd = await sb.from("orders").update({ status: "success", webhook_processed: true, processed_at: new Date().toISOString() }).eq("id", order.id);
+      if (upd.error) console.error("Failed to update order as processed:", upd.error);
+    } catch (e) {
+      console.error("Exception updating order:", e);
     }
 
-    await sb.from("payment_events").insert([{ order_id: order.id, provider: "paystack", raw_payload: { webhook: body, verify: verifyJson } }]).catch((e) => {
-      console.warn("Failed to insert payment_event:", e);
-    });
+    // call add_credits RPC
+    let rpcData;
+    try {
+      const rpcRes = await sb.rpc("add_credits", {
+        in_client_id: order.client_id,
+        in_amount: order.credits,
+        in_actor: "paystack",
+        in_reason: "payment",
+      });
+      if (rpcRes.error) {
+        console.error("add_credits RPC error:", rpcRes.error);
+        try {
+          const { data, error } = await sb.from("payment_events").insert([{ order_id: order.id, provider: "paystack", raw_payload: { webhook: body, verify: verifyJson, rpcError: rpcRes.error } }]);
+          if (error) console.error("Failed to insert rpc_error event:", error);
+        } catch (e) {
+          console.error("Exception inserting rpc_error event:", e);
+        }
+        return res.status(500).json({ ok: false, note: "rpc_failed", detail: String(rpcRes.error.message || rpcRes.error) });
+      }
+      rpcData = rpcRes.data;
+    } catch (e) {
+      console.error("Exception calling add_credits RPC:", e);
+      try {
+        const { data, error } = await sb.from("payment_events").insert([{ order_id: order.id, provider: "paystack", raw_payload: { webhook: body, verify: verifyJson, rpcException: String(e) } }]);
+        if (error) console.error("Failed to log rpc exception:", error);
+      } catch (_) {}
+      return res.status(500).json({ ok: false, error: "rpc_exception", detail: String(e) });
+    }
+
+    // log successful payment event
+    try {
+      const { data, error } = await sb.from("payment_events").insert([{ order_id: order.id, provider: "paystack", raw_payload: { webhook: body, verify: verifyJson } }]);
+      if (error) console.error("Failed to insert payment_event after rpc:", error);
+    } catch (e) {
+      console.warn("Failed to insert payment_event after rpc (exception):", e);
+    }
 
     return res.status(200).json({ ok: true, credited: rpcData });
   } catch (err) {
-    // This catch ensures an error never returns HTML; we always reply with JSON
     console.error("Unexpected webhook handler error:", err);
     return res.status(500).json({ ok: false, error: "unexpected_handler_error", detail: String(err && err.stack ? err.stack : err) });
   }
