@@ -1,6 +1,8 @@
 // api/paystack-webhook.js
 // Defensive webhook: lazy-load Supabase client and handle DB calls with try/await (no direct .catch chains)
 
+import crypto from "crypto";
+
 let supabaseServer = null;
 
 async function getSupabaseServer() {
@@ -16,6 +18,18 @@ async function getSupabaseServer() {
 
 const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY;
 
+/**
+ * Verify Paystack webhook signature using HMAC SHA512
+ */
+function verifyPaystackSignature(rawBody, signature, secret) {
+  if (!signature || !secret) return false;
+  const hash = crypto
+    .createHmac("sha512", secret)
+    .update(rawBody)
+    .digest("hex");
+  return hash === signature;
+}
+
 export default async function handler(req, res) {
   try {
     if (req.method !== "POST") {
@@ -27,21 +41,33 @@ export default async function handler(req, res) {
       return res.status(500).json({ ok: false, note: "missing_paystack_secret" });
     }
 
-    // parse body safely
+    // Get raw body for signature verification
+    let rawBody = "";
     let body = req.body;
+    
     if (!body) {
       try {
-        const raw = await new Promise((resolve) => {
+        rawBody = await new Promise((resolve) => {
           let d = "";
           req.on && req.on("data", (c) => (d += c));
           req.on && req.on("end", () => resolve(d));
           setTimeout(() => resolve(""), 50);
         });
-        body = raw ? JSON.parse(raw) : {};
+        body = rawBody ? JSON.parse(rawBody) : {};
       } catch (e) {
         console.warn("Could not parse raw webhook body:", e?.message ?? e);
         body = {};
       }
+    } else {
+      // Body already parsed by express.json()
+      rawBody = JSON.stringify(body);
+    }
+
+    // Verify webhook signature (SECURITY)
+    const signature = req.headers["x-paystack-signature"];
+    if (!verifyPaystackSignature(rawBody, signature, PAYSTACK_SECRET)) {
+      console.warn("Invalid Paystack webhook signature. Possible spoofing attempt.");
+      return res.status(401).json({ error: "invalid_signature" });
     }
 
     // lazy-load supabase client
@@ -53,9 +79,14 @@ export default async function handler(req, res) {
       return res.status(500).json({ ok: false, error: "supabase_client_load_failed", detail: String(err.message || err) });
     }
 
+    const eventType = body?.event;
     const reference = body?.data?.reference || body?.reference;
+    
+    console.log(`[Webhook] Received event: ${eventType}, reference: ${reference || "NONE"}`);
+    
     if (!reference) {
       console.warn("Webhook missing reference. Storing raw event for inspection.");
+      console.warn("Event type:", eventType, "Body keys:", Object.keys(body || {}));
       try {
         const { data, error } = await sb.from("payment_events").insert([{ provider: "paystack", raw_payload: body }]);
         if (error) console.error("Failed to insert unknown webhook event:", error);
@@ -63,6 +94,12 @@ export default async function handler(req, res) {
         console.error("Exception inserting unknown webhook event:", e);
       }
       return res.status(200).json({ ok: true, note: "no_reference_logged" });
+    }
+    
+    // Only process charge.success events for M-PESA
+    if (eventType !== "charge.success") {
+      console.log(`[Webhook] Ignoring non-charge.success event: ${eventType}`);
+      return res.status(200).json({ ok: true, note: "event_ignored", event: eventType });
     }
 
     // find order
@@ -91,15 +128,21 @@ export default async function handler(req, res) {
 
     const order = orders?.[0] || null;
     if (!order) {
-      console.warn("Webhook received for unknown order:", reference);
+      console.warn(`[Webhook] No order found for reference: ${reference}`);
+      console.warn(`[Webhook] This usually means:`);
+      console.warn(`  1. The order wasn't created before the payment was initiated`);
+      console.warn(`  2. The reference doesn't match what's in the database`);
+      console.warn(`  3. There's a timing issue - payment completed before order was saved`);
       try {
         const { data, error } = await sb.from("payment_events").insert([{ provider: "paystack", raw_payload: body }]);
         if (error) console.error("Failed to insert unknown_order_recorded event:", error);
       } catch (e) {
         console.error("Exception inserting unknown_order_recorded event:", e);
       }
-      return res.status(200).json({ ok: true, note: "unknown_order_recorded" });
+      return res.status(200).json({ ok: true, note: "unknown_order_recorded", reference });
     }
+    
+    console.log(`[Webhook] Found order ID: ${order.id}, client: ${order.client_id}, status: ${order.status}`);
 
     if (order.webhook_processed) {
       return res.status(200).json({ ok: true, note: "already_processed" });
