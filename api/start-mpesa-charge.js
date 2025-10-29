@@ -9,7 +9,7 @@ function genReference() {
 }
 
 /**
- * Normalize Kenyan phone numbers to the form: 2547XXXXXXXX
+ * Normalize Kenyan phone numbers to the form: +2547XXXXXXXX
  * Accepts:
  *  - 07XXXXXXXX
  *  - 7XXXXXXXX
@@ -21,14 +21,15 @@ function normalizeKenyanPhone(raw) {
   let s = String(raw).trim();
   s = s.replace(/[\s\-()]/g, "");
   if (s.startsWith("+")) s = s.slice(1);
-  if (/^0[7|1]\d{8}$/.test(s)) {
-    return "254" + s.slice(1);
+  
+  if (/^0[71]\d{8}$/.test(s)) {
+    return "+254" + s.slice(1);
   }
-  if (/^7\d{8}$/.test(s)) {
-    return "254" + s;
+  if (/^[71]\d{8}$/.test(s)) {
+    return "+254" + s;
   }
   if (/^254\d{9}$/.test(s)) {
-    return s;
+    return "+" + s;
   }
   return null;
 }
@@ -51,7 +52,7 @@ export default async function handler(req, res) {
   if (!normalized) {
     return res.status(400).json({
       error: "invalid_phone_format",
-      note: "Provide Kenyan phone as 07XXXXXXXX or 2547XXXXXXXX or +2547XXXXXXXX"
+      note: "Provide Kenyan phone as 07XXXXXXXX, 7XXXXXXXX, 2547XXXXXXXX, or +2547XXXXXXXX"
     });
   }
 
