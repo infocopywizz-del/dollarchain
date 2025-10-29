@@ -19,19 +19,14 @@ function genReference() {
 function normalizeKenyanPhone(raw) {
   if (!raw) return null;
   let s = String(raw).trim();
-  // remove spaces, dashes, parentheses
   s = s.replace(/[\s\-()]/g, "");
-  // strip leading +
   if (s.startsWith("+")) s = s.slice(1);
-  // If starts with 0 (e.g., 07...), drop leading 0 and prefix 254
   if (/^0[7|1]\d{8}$/.test(s)) {
     return "254" + s.slice(1);
   }
-  // If starts with 7 and 9 digits (7XXXXXXXX)
   if (/^7\d{8}$/.test(s)) {
     return "254" + s;
   }
-  // If already starts with 254 and 12 digits
   if (/^254\d{9}$/.test(s)) {
     return s;
   }
@@ -47,13 +42,11 @@ export default async function handler(req, res) {
   }
   const { client_id, amount, phone, credits, email } = body || {};
 
-  // Validate inputs
   if (!client_id) return res.status(400).json({ error: "missing_client_id" });
   if (!phone) return res.status(400).json({ error: "missing_phone" });
   if (!Number.isFinite(Number(amount))) return res.status(400).json({ error: "missing_amount" });
   if (!PAYSTACK_SECRET) return res.status(500).json({ error: "paystack_not_configured" });
 
-  // Normalize and validate phone
   const normalized = normalizeKenyanPhone(phone);
   if (!normalized) {
     return res.status(400).json({
@@ -62,10 +55,10 @@ export default async function handler(req, res) {
     });
   }
 
-  const amountCents = Number(amount); // smallest unit (e.g., KES * 100 for cents)
+  const amountCents = Number(amount);
   const reference = genReference();
 
-  // 1) Insert pending order (amount_cents expected by your schema)
+  // Insert pending order
   try {
     const { data: ins, error: insErr } = await supabaseServer
       .from("orders")
@@ -90,22 +83,21 @@ export default async function handler(req, res) {
     return res.status(500).json({ error: "db_insert_exception", detail: String(e) });
   }
 
-  // 2) Build Paystack payload for mobile money charge
+  // PATCHED: Add country: "KE" for Paystack M-PESA sandbox
   const payload = {
     email: email || `no-email-${client_id}@dollarchain.store`,
     amount: amountCents,
     currency: DEFAULT_CURRENCY,
     mobile_money: {
       phone: normalized,
-      provider: "mpesa"
+      provider: "mpesa",
+      country: "KE"   // <- PATCHED
     },
     reference
   };
 
-  // Helpful debug log (visible in Vercel logs)
   console.log("Starting MPESA charge — payload:", JSON.stringify(payload));
 
-  // 3) Call Paystack Charge API
   try {
     const resp = await fetch("https://api.paystack.co/charge", {
       method: "POST",
@@ -119,7 +111,6 @@ export default async function handler(req, res) {
 
     const json = await resp.json();
 
-    // Return Paystack's response (previous behavior preserved)
     if (!resp.ok) {
       console.warn("Paystack charge returned non-OK:", JSON.stringify(json));
       return res.status(502).json({ paystack: json, reference });
