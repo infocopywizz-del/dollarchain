@@ -14,25 +14,28 @@ export default async function handler(req, res) {
   // support JSON body or raw string
   let body = req.body;
   if (typeof body === "string") {
-    try { body = JSON.parse(body); } catch (e) { /* leave as-is */ }
+    try { body = JSON.parse(body); } catch (e) { /* ignore */ }
   }
   const { client_id, amount, email, credits } = body || {};
 
-  if (!client_id || !Number.isFinite(amount) || !email) {
-    return res.status(400).json({ error: "invalid_payload", note: "client_id, amount (in smallest currency unit), email required" });
+  if (!client_id || !email) {
+    return res.status(400).json({ error: "invalid_payload", note: "client_id and email required" });
   }
   if (!PAYSTACK_SECRET) return res.status(500).json({ error: "paystack_not_configured" });
 
+  // amountCents = incoming amount (smallest currency unit), default to 10000 if missing
+  const amountCents = Number.isFinite(Number(amount)) ? Number(amount) : 10000;
+
   const reference = genReference();
 
-  // 1) Insert pending order
+  // 1) Insert pending order (use amount_cents to match DB)
   try {
     const { data: orderData, error: insertErr } = await supabaseServer
       .from("orders")
       .insert([{
         client_id,
         credits: credits || 0,
-        amount,
+        amount_cents: amountCents,
         paystack_reference: reference,
         status: "pending",
         webhook_processed: false,
@@ -50,7 +53,7 @@ export default async function handler(req, res) {
     return res.status(500).json({ error: "db_insert_exception", detail: String(e) });
   }
 
-  // 2) Initialize Paystack transaction
+  // 2) Initialize Paystack transaction (Paystack expects amount in smallest unit)
   try {
     const initRes = await fetch("https://api.paystack.co/transaction/initialize", {
       method: "POST",
@@ -61,7 +64,7 @@ export default async function handler(req, res) {
       },
       body: JSON.stringify({
         email,
-        amount,
+        amount: amountCents,
         reference,
         callback_url: `${BASE_URL}/paystack-return`
       })
