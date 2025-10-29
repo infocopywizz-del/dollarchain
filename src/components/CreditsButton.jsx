@@ -1,16 +1,15 @@
 import React, { useState } from "react";
 
 export default function CreditsButton() {
-  // Existing state
   const [clientId, setClientId] = useState("");
   const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);
 
-  // New state for test payment
-  const [testLoading, setTestLoading] = useState(false);
-  const [testMessage, setTestMessage] = useState("");
+  const [payLoading, setPayLoading] = useState(false);
+  const [payMessage, setPayMessage] = useState("");
+  const [lastReference, setLastReference] = useState(null);
+  const API_BASE = import.meta.env.VITE_API_URL || window.location.origin;
 
-  // Existing function: fetch credits
   async function fetchCredits() {
     if (!clientId) {
       setResult({ error: "Enter client_id (example: client_123)" });
@@ -19,7 +18,7 @@ export default function CreditsButton() {
     setLoading(true);
     setResult(null);
     try {
-      const r = await fetch(`/api/credits?client_id=${encodeURIComponent(clientId)}`);
+      const r = await fetch(`${API_BASE}/api/credits?client_id=${encodeURIComponent(clientId)}`);
       const json = await r.json();
       setResult(json);
     } catch (err) {
@@ -29,42 +28,69 @@ export default function CreditsButton() {
     }
   }
 
-  // New function: trigger test Paystack payment
-  async function handleTestPayment() {
-    setTestLoading(true);
-    setTestMessage("");
-
+  // Start a real Paystack test payment (server-side will create 'orders' and initialize)
+  async function startPaystackPayment() {
+    setPayLoading(true);
+    setPayMessage("");
     try {
-      const res = await fetch(`${import.meta.env.VITE_API_URL}/api/paystack-webhook`, {
+      const payload = {
+        client_id: clientId || "client_test_1",
+        amount: 10000, // amount in smallest currency unit (e.g., kobo) - change as needed
+        email: import.meta.env.VITE_PAYSTACK_TEST_EMAIL || "test@example.com",
+        credits: 100
+      };
+      const res = await fetch(`${API_BASE}/api/create-paystack-payment`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-paystack-signature": "test-signature", // placeholder for test
-        },
-        body: JSON.stringify({
-          event: "charge.success",
-          data: {
-            reference: "test-ref-" + Date.now(),
-            status: "success",
-            amount: 100,
-            email: import.meta.env.VITE_PAYSTACK_TEST_EMAIL || "test@example.com",
-          },
-        }),
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
       });
+      const j = await res.json();
+      if (!res.ok) {
+        setPayMessage("Payment init failed: " + (j.error || JSON.stringify(j)));
+        setPayLoading(false);
+        return;
+      }
 
-      const data = await res.json();
-      if (data.ok) setTestMessage("Test payment successful! Credits updated.");
-      else setTestMessage(`Webhook responded with note: ${data.note || data.error}`);
+      // Open Paystack checkout in new tab
+      if (j.authorization_url) {
+        window.open(j.authorization_url, "_blank");
+        setPayMessage(`Opened checkout. Reference: ${j.reference || "n/a"}`);
+        setLastReference(j.reference || null);
+      } else {
+        setPayMessage("No authorization_url returned.");
+      }
     } catch (err) {
-      setTestMessage("Error triggering test payment: " + err.message);
+      setPayMessage("Error starting payment: " + String(err));
+    } finally {
+      setPayLoading(false);
     }
+  }
 
-    setTestLoading(false);
+  // Verify the last reference (poll / manual verify)
+  async function verifyLastReference() {
+    if (!lastReference) { setPayMessage("No reference to verify."); return; }
+    setPayLoading(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/verify-paystack-payment`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reference: lastReference })
+      });
+      const j = await res.json();
+      if (res.ok) {
+        setPayMessage("Verify result: " + (j.ok ? "success" : (j.note || JSON.stringify(j))));
+      } else {
+        setPayMessage("Verify failed: " + (j.error || JSON.stringify(j)));
+      }
+    } catch (err) {
+      setPayMessage("Verify error: " + String(err));
+    } finally {
+      setPayLoading(false);
+    }
   }
 
   return (
     <div>
-      {/* Existing credit checker */}
       <div style={{ marginBottom: 16 }}>
         <label>
           Client ID:&nbsp;
@@ -73,20 +99,19 @@ export default function CreditsButton() {
         <button onClick={fetchCredits} disabled={loading} style={{ marginLeft: 8 }}>
           {loading ? "Checking..." : "Check credits"}
         </button>
-
         <div style={{ marginTop: 12 }}>
-          <pre style={{ background: "#f6f8fa", padding: 12 }}>
-            {result ? JSON.stringify(result, null, 2) : "No result yet"}
-          </pre>
+          <pre style={{ background: "#f6f8fa", padding: 12 }}>{result ? JSON.stringify(result, null, 2) : "No result yet"}</pre>
         </div>
       </div>
 
-      {/* New Paystack test payment button */}
       <div>
-        <button onClick={handleTestPayment} disabled={testLoading} style={{ padding: "8px 16px" }}>
-          {testLoading ? "Processing..." : "Test Add Credits"}
+        <button onClick={startPaystackPayment} disabled={payLoading} style={{ padding: "8px 16px", marginRight: 8 }}>
+          {payLoading ? "Starting..." : "Start Test Payment"}
         </button>
-        {testMessage && <p style={{ marginTop: 8 }}>{testMessage}</p>}
+        <button onClick={verifyLastReference} disabled={payLoading || !lastReference} style={{ padding: "8px 12px" }}>
+          Verify last payment
+        </button>
+        {payMessage && <p style={{ marginTop: 8 }}>{payMessage}</p>}
       </div>
     </div>
   );
