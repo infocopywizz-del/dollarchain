@@ -6,7 +6,8 @@ export const config = { api: { bodyParser: false } };
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET;
+// Accept either PAYSTACK_SECRET or PAYSTACK_SECRET_KEY so we don't break existing env names
+const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET ?? process.env.PAYSTACK_SECRET_KEY;
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
@@ -18,6 +19,11 @@ async function getRawBody(req) {
 
 function verifyPaystackSignature(rawBuffer, signature) {
   if (!signature) return false;
+  if (!PAYSTACK_SECRET) {
+    // avoid crash if secret missing; log for debugging
+    console.error('verifyPaystackSignature: PAYSTACK_SECRET not configured');
+    return false;
+  }
   const hash = crypto.createHmac('sha512', PAYSTACK_SECRET).update(rawBuffer).digest('hex');
   return signature === hash;
 }
