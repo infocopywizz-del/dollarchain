@@ -57,7 +57,7 @@ export default async function handler(req, res) {
       .from('processed_events')
       .insert({
         event_id: processed_event_id,
-        event_name,
+        event_name: eventName,
         reference,
         status,
         payload
@@ -113,7 +113,7 @@ export default async function handler(req, res) {
     await supabase.from('payment_events').insert({
       event_id: processed_event_id,
       reference,
-      event_name,
+      event_name: eventName,
       status,
       payload,
       order_id: null
@@ -163,7 +163,7 @@ export default async function handler(req, res) {
     await supabase.from('payment_events').insert({
       event_id: processed_event_id,
       reference,
-      event_name,
+      event_name: eventName,
       status,
       payload,
       order_id: ord.id
